@@ -25,19 +25,50 @@ ERROR_UNSUPPORTED_SUBGROUPS='Error: subgroups not supported for GitHub platform'
 ERROR_UNSUPPORTED_TYPE='Error: unsupported type'
 
 # logging functions
+script_name="${0##*/}"
+if [ -n "${BASH_VERSION:-}" ]; then
+  my_log(){
+    local depth=${1:-0}
+    shift
+    echo "${script_name}:${FUNCNAME[depth+1]:-}:${BASH_LINENO[depth]:-}: " "$@" >&2
+  }
+else
+  my_log(){
+    local depth=${1:-0}
+    shift
+    echo "${script_name}: " "$@" >&2
+  }
+fi
 log() {
-    printf '%s\n' "$1" >&2
+  my_log 1 "$@"
 }
 
 error() {
-    printf '%s\n' "$1"
-    exit 1
+  my_log 1 "$@"
+  exit 1
 }
-
+my_run_cmd(){
+  local RValue=0
+  #my_log 1 "$@"
+  "$@" || RValue=$?
+  if [ "${RValue}" != "0" ] ; then
+    my_log 1 "Returned(${RValue})" "$@"
+  fi
+  return "${RValue}"
+}
+wrap_jq(){
+  local RValue=0
+  content="$(cat)"
+  echo "${content}" | jq "$@" || RValue=$?
+  if [ "${RValue}" != "0" ] ; then
+    my_log 1 "Returned(${RValue}) " "jq" "$@" "content=${content}"
+  fi
+  return "${RValue}"
+}
 # This function filters JSON input using jq and prints the results.
 filter_json_with_jq() {
     jq_query="$1"
-    jq -r "$jq_query"
+    wrap_jq -r "$jq_query"
 }
 
 # Argument parsing function
@@ -54,7 +85,7 @@ parse_arguments() {
     # Set default values for options
     flatten=false
     git_args=''
-    dest_dir=''
+    dest_dir='.'
     threads=4
     use_ssh=false
 
@@ -198,7 +229,7 @@ make_request() {
     else
         request_cmd="wget --no-check-certificate -q -S --server-response"
     fi
-    http_code=$($request_cmd "$header_opt" "$header" "${url}" -o "$response_file" 2>&1)
+    http_code=$(my_run_cmd $request_cmd "$header_opt" "$header" "${url}" -o "$response_file" 2>&1)
     http_code=$(printf '%s' "$http_code" | tr -d '\n' | tr -d "'")
     response=$(cat "$response_file")
     if [ "$http_code" != "200" ]; then
@@ -207,7 +238,7 @@ make_request() {
     rm "$response_file"
     #log "response=${response}"
     # Check if the response is a valid JSON
-    if ! printf '%s' "$response" | jq type 1>/dev/null; then
+    if ! printf '%s' "$response" | wrap_jq type 1>/dev/null; then
         error "$ERROR_INVALID_JSON"
     fi
     printf '%s' "$response"
@@ -261,7 +292,7 @@ make_api_request() {
     while [ -n "$url" ]; do
         response=$(make_request "${url}" "$header")
         # Check if the response is a JSON array
-        if ! printf '%s' "$response" | jq -e '. | type == "array"' >/dev/null 2>&1; then
+        if ! printf '%s' "$response" | wrap_jq -e '. | type == "array"' >/dev/null 2>&1; then
             error "$ERROR_NOT_ARRAY"
         fi
         # Concatenate the response with previous data
@@ -275,7 +306,7 @@ make_api_request() {
             url="$next_url"
         else
             # If the platform is GitLab, check if there is a "next" URL in the response
-            #next_url=$(printf '%s\n' "$response" | jq '._links.next.href')
+            #next_url=$(printf '%s\n' "$response" | wrap_jq '._links.next.href')
             #url="$next_url"
             # FIXME
             url=""
@@ -359,7 +390,7 @@ determine_github_entity_type() {
 }
 
 # Function to get the entity ID from the entity name
-get_entity_id() {
+get_entity_ids() {
     platform=$1
     entity_name=$2
     token="$3"
@@ -370,7 +401,7 @@ get_entity_id() {
     if [ "$platform" = 'gitlab' ]; then
         url="${base_url}/groups?search=${entity_name}&simple=yes"
         response=$(make_request "${url}" "$header")
-        entities=$(printf '%s' "$response" | jq -r '.[].id')
+        entities=$(printf '%s' "$response" | wrap_jq -r '.[].id')
     elif [ "$platform" = 'github' ]; then
         entity_type=$(determine_github_entity_type "$entity_name" "$token")
         if [ "$entity_type" = 'user' ]; then
@@ -381,19 +412,19 @@ get_entity_id() {
             error "Error: Invalid entity type: $entity_type"
         fi
         response=$(make_request "${url}" "$header")
-        entities=$(printf '%s' "$response" | jq -r '.id')
+        entities=$(printf '%s' "$response" | wrap_jq -r '.id')
     else
         error "$ERROR_UNSUPPORTED_PLATFORM"
     fi
 
     if [ -z "$entities" ]; then
         #log "Response from API: $response"
-        error "$ERROR_GROUP_NOT_FOUND: ${entity_name}"
+        error "$ERROR_GROUP_NOT_FOUND: entity_name:${entity_name} url:${url}"
     fi
 
-    if [ "$(printf '%s' "$entities" | wc -l)" -gt 1 ]; then
-        error "$ERROR_MULTIPLE_GROUPS_FOUND"
-    fi
+    #if [ "$(printf '%s' "$entities" | wc -l)" -gt 1 ]; then
+    #    error "$ERROR_MULTIPLE_GROUPS_FOUND: entity_name:${entity_name} url:${url}"
+    #fi
 
     printf '%s' "$entities"
 }
@@ -407,7 +438,7 @@ list_entity_items() {
     type="$4"
 
     response=$(make_api_request "$platform" "$entity_id" "$type" "$token")
-    items=$(printf '%s' "$response" | jq -c '.[]')
+    items=$(printf '%s' "$response" | wrap_jq -c '.[]')
     if [ -z "$items" ]; then
         return
     fi
@@ -415,17 +446,21 @@ list_entity_items() {
     # Loop through each item in the response
     printf '%s\n' "$items" | while read -r item; do
         # Ensure the item is an object
-        if ! printf '%s' "$item" | jq -e '. | type == "object"' >/dev/null 2>&1; then
+        if ! printf '%s' "$item" | wrap_jq -e '. | type == "object"' >/dev/null 2>&1; then
             log "$ERROR_NOT_OBJECT: $type: $item"
             continue
         fi
-        item_id=$(printf '%s' "$item" | jq -r '.id')
+        item_id=$(printf '%s' "$item" | wrap_jq -r '.id')
         if [ -z "$item_id" ]; then
             continue
         fi
-        item_name=$(printf '%s' "$item" | jq -r '.name')
+        for clabel in '.full_path' '.full_name' '.name' ; do
+          item_name=$(printf '%s' "$item" | wrap_jq -r ".${clabel}")
+          [ -z "$item_name" -o "$item_name" == 'null' ] || continue
+          break
+        done
         if [ -z "$item_name" ]; then
-            continue
+          continue
         fi
         # Determine the type of the item and set the prefix accordingly
         if [ "$type" = "projects" ]; then
@@ -471,21 +506,21 @@ list_github_org() {
     token="$2"
 
     response=$(make_api_request "github" "$org" projects "$token")
-    items=$(printf '%s' "$response" | jq -c '.[]')
+    items=$(printf '%s' "$response" | wrap_jq -c '.[]')
     if [ -z "$items" ]; then
         return
     fi
 
     printf '%s\n' "$items" | while read -r item; do
-        if ! printf '%s' "$item" | jq -e '. | type == "object"' >/dev/null 2>&1; then
+        if ! printf '%s' "$item" | wrap_jq -e '. | type == "object"' >/dev/null 2>&1; then
             log "$ERROR_NOT_OBJECT: projects: $item"
             continue
         fi
-        item_id=$(printf '%s' "$item" | jq -r '.id')
+        item_id=$(printf '%s' "$item" | wrap_jq -r '.id')
         if [ -z "$item_id" ]; then
             continue
         fi
-        item_name=$(printf '%s' "$item" | jq -r '.name')
+        item_name=$(printf '%s' "$item" | wrap_jq -r '.name')
         if [ -z "$item_name" ]; then
             continue
         fi
@@ -584,7 +619,7 @@ run_commands() {
     done
   # If the number of threads is greater than 1, execute the commands in parallel
   else
-    xargs -P "$threads" -I {} sh -c "{}" || exit 1
+    xargs -P "$threads" -I {} sh -xc "{}" || exit 1
   fi
 }
 
@@ -615,6 +650,19 @@ run_git_clones() {
     done | run_commands "$threads"
 }
 
+# Function to check if dst-dir is valid
+check_dst_dir_valid() {
+    # Check if destination directory exists, and create it if it does not exist
+    if [ ! -d "$dest_dir" ]; then
+        mkdir -p "$dest_dir"
+    fi
+
+    # Check if destination directory is empty, and exit with an error message if it is not
+    if [ "$(ls -A "$dest_dir")" ]; then
+        error "Error: destination directory '$dest_dir' is not empty"
+    fi
+}
+
 # Function to clone all projects in an entity
 clone_projects() {
     platform=$1
@@ -625,16 +673,6 @@ clone_projects() {
     dest_dir=$6
     threads=$7
     token="$8"
-
-    # Check if destination directory exists, and create it if it does not exist
-    if [ ! -d "$dest_dir" ]; then
-        mkdir -p "$dest_dir"
-    fi
-
-    # Check if destination directory is empty, and exit with an error message if it is not
-    if [ "$(ls -A "$dest_dir")" ]; then
-        error "Error: destination directory '$dest_dir' is not empty"
-    fi
 
     if [ "$threads" -le 1 ] || [ "$PARALLEL_TOOL" = "none" ]; then
         cloning="sequential"
@@ -665,22 +703,25 @@ main() {
 
     if printf '%s' "$group_name_or_id" | grep -E '^[0-9]+$' >/dev/null; then
         # If the argument is a number, use it as the group ID
-        entity_id="$group_name_or_id"
+        entity_ids="$group_name_or_id"
     else
         # If the argument is not a number, use it as the group name
-        entity_id=$(get_entity_id "$platform" "$group_name_or_id" "$token")
+        entity_ids=$(get_entity_ids "$platform" "$group_name_or_id" "$token")
     fi
 
-    if [ "$action" = 'list' ]; then
-        list_entity "$platform" "$entity_id" "$token"
-    elif [ "$action" = 'clone' ]; then
-        if [ -z "$entity_id" ]; then
-            error 'Error: group ID is required'
-        fi
-        clone_projects "$platform" "$entity_id" "$use_ssh" "$flatten" "$git_args" "$dest_dir" "$threads" "$token"
-    else
-        error "$ERROR_UNSUPPORTED_ACTION"
-    fi
+    check_dst_dir_valid "$dest_dir"
+    for entity_id in ${entity_ids} ; do
+      if [ "$action" = 'list' ]; then
+          list_entity "$platform" "$entity_id" "$token"
+      elif [ "$action" = 'clone' ]; then
+          if [ -z "$entity_id" ]; then
+              error 'Error: group ID is required'
+          fi
+          clone_projects "$platform" "$entity_id" "$use_ssh" "$flatten" "$git_args" "$dest_dir" "$threads" "$token"
+      else
+          error "$ERROR_UNSUPPORTED_ACTION"
+      fi
+    done
 }
 
 #script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
